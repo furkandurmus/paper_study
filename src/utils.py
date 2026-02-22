@@ -2,14 +2,20 @@
 Utility functions for model loading, training setup, and common operations.
 """
 
+import inspect
+import json
 import os
 import random
 import logging
+import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import torch
 import numpy as np
 from transformers import (
+    AutoModelForImageTextToText,
     AutoModelForVision2Seq,
     AutoProcessor,
     BitsAndBytesConfig
@@ -42,6 +48,90 @@ def set_seed(seed: int = 42):
     # torch.backends.cudnn.benchmark = False
 
 
+def _load_embedded_bnb_quant_config(model_name_or_path: str) -> Optional[BitsAndBytesConfig]:
+    """Build BitsAndBytesConfig from a local checkpoint's config.json when present."""
+    model_dir = Path(model_name_or_path)
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+    except Exception:
+        return None
+
+    quant_cfg = raw_config.get("quantization_config")
+    if not isinstance(quant_cfg, dict):
+        return None
+    if quant_cfg.get("quant_method") != "bitsandbytes":
+        return None
+
+    sig = inspect.signature(BitsAndBytesConfig.__init__).parameters
+    kwargs = {}
+    for key, value in quant_cfg.items():
+        if key.startswith("_"):
+            continue
+        if key not in sig:
+            continue
+        if key == "bnb_4bit_compute_dtype" and isinstance(value, str):
+            value = getattr(torch, value, value)
+        kwargs[key] = value
+
+    try:
+        return BitsAndBytesConfig(**kwargs)
+    except Exception:
+        return None
+
+
+@contextmanager
+def _sanitized_local_model_dir(model_name_or_path: str):
+    """
+    Work around a Transformers config serialization bug for some bnb checkpoints.
+    Creates a temporary local copy with `quantization_config` removed from config.json.
+    """
+    model_dir = Path(model_name_or_path)
+    config_path = model_dir / "config.json"
+    if not (model_dir.is_dir() and config_path.exists()):
+        yield model_name_or_path
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+    except Exception:
+        yield model_name_or_path
+        return
+
+    if "quantization_config" not in raw_config:
+        yield model_name_or_path
+        return
+
+    tmp_dir_obj = tempfile.TemporaryDirectory(prefix="hf_model_cfg_fix_")
+    tmp_dir = Path(tmp_dir_obj.name)
+    try:
+        for child in model_dir.iterdir():
+            dst = tmp_dir / child.name
+            if child.name == "config.json":
+                continue
+            try:
+                os.symlink(child, dst)
+            except OSError:
+                if child.is_dir():
+                    shutil.copytree(child, dst, symlinks=True)
+                else:
+                    shutil.copy2(child, dst)
+
+        sanitized = dict(raw_config)
+        sanitized.pop("quantization_config", None)
+        with open(tmp_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(sanitized, f)
+
+        yield str(tmp_dir)
+    finally:
+        tmp_dir_obj.cleanup()
+
+
 def load_model_and_processor(
     model_name_or_path: str,
     model_config: Dict[str, Any],
@@ -62,8 +152,9 @@ def load_model_and_processor(
     """
     logging.info(f"Loading model: {model_name_or_path}")
     
-    # Setup quantization config if using QLoRA
+    # Setup quantization config if using QLoRA or loading a local bnb-quantized checkpoint.
     quantization_config = None
+    embedded_bnb_quant = _load_embedded_bnb_quant_config(model_name_or_path)
     if use_qlora:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -72,25 +163,35 @@ def load_model_and_processor(
             bnb_4bit_quant_type=model_config.get("bnb_4bit_quant_type", "nf4")
         )
         logging.info("Using 4-bit quantization (QLoRA)")
+    elif embedded_bnb_quant is not None:
+        quantization_config = embedded_bnb_quant
+        logging.info("Using embedded bitsandbytes quantization config from local checkpoint")
     
     # Load processor first
     processor = AutoProcessor.from_pretrained(
         model_name_or_path,
         trust_remote_code=model_config.get("trust_remote_code", True)
     )
-    
-    # Load model
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_name_or_path,
-        torch_dtype=getattr(torch, model_config.get("torch_dtype", "bfloat16")),
-        attn_implementation=model_config.get("attn_implementation", "flash_attention_2"),
-        quantization_config=quantization_config,
-        trust_remote_code=model_config.get("trust_remote_code", True),
-        device_map="auto" if use_qlora else None
-    )
+
+    # Some local bnb checkpoints trigger a transformers config repr bug during AutoConfig loading.
+    # Retry via a sanitized temporary config.json and pass quantization explicitly.
+    load_path = model_name_or_path
+    with _sanitized_local_model_dir(model_name_or_path) as maybe_sanitized_path:
+        load_path = maybe_sanitized_path
+        common_kwargs = {
+            "torch_dtype": getattr(torch, model_config.get("torch_dtype", "bfloat16")),
+            "attn_implementation": model_config.get("attn_implementation", "flash_attention_2"),
+            "quantization_config": quantization_config,
+            "trust_remote_code": model_config.get("trust_remote_code", True),
+            "device_map": "auto" if use_qlora else None,
+        }
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(load_path, **common_kwargs)
+        except Exception:
+            model = AutoModelForVision2Seq.from_pretrained(load_path, **common_kwargs)
     
     # Prepare model for k-bit training if using QLoRA
-    if use_qlora:
+    if use_qlora or (quantization_config is not None):
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=model_config.get("gradient_checkpointing", True)
@@ -128,7 +229,10 @@ def load_checkpoint(
     if is_peft:
         model = PeftModel.from_pretrained(model, checkpoint_path)
     else:
-        model = AutoModelForVision2Seq.from_pretrained(checkpoint_path)
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(checkpoint_path)
+        except Exception:
+            model = AutoModelForVision2Seq.from_pretrained(checkpoint_path)
     
     return model
 
