@@ -1,0 +1,99 @@
+{
+  "model": {
+    "model_name_or_path": "Qwen/Qwen2-VL-7B-Instruct",
+    "model_type": "qwen2-vl",
+    "trust_remote_code": true,
+    "torch_dtype": "bfloat16",
+    "attn_implementation": "flash_attention_2",
+    "use_qlora": true,
+    "load_in_4bit": true,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_use_double_quant": true,
+    "bnb_4bit_quant_type": "nf4"
+  },
+  "lora": {
+    "use_lora": true,
+    "r": 64,
+    "lora_alpha": 128,
+    "lora_dropout": 0.05,
+    "bias": "none",
+    "task_type": "CAUSAL_LM",
+    "target_modules": [
+      "q_proj", "k_proj", "v_proj", "o_proj",
+      "gate_proj", "up_proj", "down_proj"
+    ],
+    "modules_to_save": ["embed_tokens", "lm_head"]
+  },
+  "data": {
+    "train_jsonl": "data/train.jsonl",
+    "val_jsonl": "data/val.jsonl",
+    "test_jsonl": "data/test.jsonl",
+    "images_root": "data/images",
+    "image_size": 448,
+    "max_images_per_case": 4,
+    "max_seq_length": 2048,
+    "max_prompt_length": 512,
+    "max_response_length": 1024
+  },
+  "training": {
+    "output_dir": "outputs/sft",
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "lr_scheduler_type": "cosine",
+    "logging_steps": 10,
+    "eval_steps": 100,
+    "save_steps": 500,
+    "save_total_limit": 3,
+    "eval_strategy": "steps",
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "eval_loss",
+    "greater_is_better": false,
+    "seed": 42,
+    "bf16": true,
+    "fp16": false,
+    "gradient_checkpointing": true,
+    "dataloader_num_workers": 4,
+    "remove_unused_columns": false,
+    "report_to": ["tensorboard", "wandb"]
+  },
+  "generation": {
+    "num_candidates": 4,
+    "max_new_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 50,
+    "do_sample": true,
+    "repetition_penalty": 1.1
+  },
+  "alignment": {
+    "alignment_type": "dpo",
+    "output_dir": "outputs/alignment",
+    "beta": 0.1,
+    "label_smoothing": 0.0,
+    "desirable_weight": 1.0,
+    "undesirable_weight": 1.0,
+    "orpo_alpha": 1.0,
+    "grpo_group_size": 4,
+    "grpo_epsilon": 0.2,
+    "num_train_epochs": 1,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.00005,
+    "logging_steps": 10,
+    "save_steps": 500
+  },
+  "evaluation": {
+    "output_dir": "outputs/evaluation",
+    "metrics": ["bleu", "rouge", "structural", "clinical"],
+    "hallucination_weight": 1.0,
+    "consistency_weight": 1.0,
+    "uncertainty_weight": 0.5,
+    "use_llm_judge": false,
+    "llm_judge_model": null
+  }
+}

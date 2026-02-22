@@ -1,0 +1,32 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.40.0
+accelerate>=0.30.0
+peft>=0.11.0
+bitsandbytes>=0.43.0
+
+# Training
+trl>=0.9.0  # For DPO, KTO, ORPO trainers
+deepspeed>=0.14.0  # Optional: for distributed training
+
+# Data processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Evaluation
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
+nltk>=3.8.0
+
+# Utilities
+tqdm>=4.65.0
+wandb>=0.17.0  # Optional: for experiment tracking
+tensorboard>=2.16.0  # Optional: for local logging
+
+# Optional: Flash Attention (install separately if needed)
+# flash-attn>=2.5.0  # Requires CUDA, install with: pip install flash-attn --no-build-isolation
+
+# Development
+pytest>=8.0.0  # Optional: for testing
+black>=24.0.0  # Optional: for code formatting
