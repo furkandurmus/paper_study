@@ -162,6 +162,22 @@ def parse_args():
     return parser.parse_args()
 
 
+def ensure_trl_fsdp_compat():
+    """
+    TRL>=0.29 imports `torch.distributed.fsdp.FSDPModule`, which is not exposed
+    in some torch builds (e.g. 2.5.x). Provide a best-effort alias.
+    """
+    try:
+        import torch.distributed.fsdp as fsdp_mod
+    except Exception:
+        return
+
+    if hasattr(fsdp_mod, "FSDPModule"):
+        return
+    if hasattr(fsdp_mod, "FullyShardedDataParallel"):
+        fsdp_mod.FSDPModule = fsdp_mod.FullyShardedDataParallel
+
+
 def parse_report_to(report_to: str) -> List[str]:
     value = report_to.strip().lower()
     if value in {"", "none", "null", "false"}:
@@ -548,6 +564,7 @@ def load_with_attention_fallback(model_path: str, model_config: Dict[str, Any], 
 
 def main():
     args = parse_args()
+    ensure_trl_fsdp_compat()
 
     if not os.path.exists(args.preference_data):
         raise FileNotFoundError(f"Preference data not found: {args.preference_data}")

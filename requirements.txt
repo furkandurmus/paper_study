@@ -1,32 +1,43 @@
-# Core dependencies
-torch>=2.0.0
-torchvision>=0.15.0
-transformers>=4.40.0
-accelerate>=0.30.0
-peft>=0.11.0
-bitsandbytes>=0.43.0
+# Tested baseline for this repo on Python 3.11 and recent NVIDIA GPUs.
+# Installs CUDA 12.8 PyTorch wheels from the official PyTorch index.
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-# Training
-trl>=0.9.0  # For DPO, KTO, ORPO trainers
-deepspeed>=0.14.0  # Optional: for distributed training
+# PyTorch stack
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+triton==3.6.0
 
-# Data processing
-Pillow>=10.0.0
-numpy>=1.24.0
+# Hugging Face / training
+transformers==5.3.0
+accelerate==1.13.0
+peft==0.18.1
+trl==0.29.0
+datasets==4.6.1
+deepspeed==0.18.7
+
+# Core utilities
+numpy==2.1.2
+Pillow==10.2.0
+tqdm==4.66.5
+
+# Logging / tracking
+tensorboard>=2.16,<3
+wandb>=0.25,<0.26
 
 # Evaluation
-rouge-score>=0.1.2
-sacrebleu>=2.3.0
-nltk>=3.8.0
-
-# Utilities
-tqdm>=4.65.0
-wandb>=0.17.0  # Optional: for experiment tracking
-tensorboard>=2.16.0  # Optional: for local logging
-
-# Optional: Flash Attention (install separately if needed)
-# flash-attn>=2.5.0  # Requires CUDA, install with: pip install flash-attn --no-build-isolation
+rouge-score>=0.1.2,<0.2
+sacrebleu>=2.4,<3
+nltk>=3.9,<4
 
 # Development
-pytest>=8.0.0  # Optional: for testing
-black>=24.0.0  # Optional: for code formatting
+pytest>=8,<9
+black>=24,<26
+
+# Optional extras
+# bitsandbytes can be useful for quantized loading / QLoRA, but it is more brittle
+# across new GPU architectures and is not required for the current full-precision path.
+bitsandbytes>=0.43
+#
+# flash-attn is optional and should be installed separately if you specifically want it:
+# pip install flash-attn --no-build-isolation

@@ -14,13 +14,42 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import torch
 import numpy as np
-from transformers import (
-    AutoModelForImageTextToText,
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    BitsAndBytesConfig
-)
+from transformers import AutoProcessor, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # transformers versions without this class
+    AutoModelForImageTextToText = None
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # transformers versions without this class
+    AutoModelForVision2Seq = None
+
+
+def _load_vision_model_from_pretrained(model_name_or_path: str, **kwargs):
+    """
+    Load multimodal model across transformers API variants.
+    Prefers AutoModelForImageTextToText, falls back to AutoModelForVision2Seq.
+    """
+    candidates = [AutoModelForImageTextToText, AutoModelForVision2Seq]
+    errors = []
+
+    for model_cls in candidates:
+        if model_cls is None:
+            continue
+        try:
+            return model_cls.from_pretrained(model_name_or_path, **kwargs)
+        except Exception as exc:
+            errors.append(f"{model_cls.__name__}: {exc}")
+
+    if errors:
+        raise RuntimeError("Failed to load vision model. " + " | ".join(errors))
+    raise RuntimeError(
+        "No supported multimodal AutoModel class found in transformers. "
+        "Expected AutoModelForImageTextToText or AutoModelForVision2Seq."
+    )
 
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
@@ -185,10 +214,7 @@ def load_model_and_processor(
             "trust_remote_code": model_config.get("trust_remote_code", True),
             "device_map": "auto" if use_qlora else None,
         }
-        try:
-            model = AutoModelForImageTextToText.from_pretrained(load_path, **common_kwargs)
-        except Exception:
-            model = AutoModelForVision2Seq.from_pretrained(load_path, **common_kwargs)
+        model = _load_vision_model_from_pretrained(load_path, **common_kwargs)
     
     # Prepare model for k-bit training if using QLoRA
     if use_qlora or (quantization_config is not None):
@@ -229,10 +255,7 @@ def load_checkpoint(
     if is_peft:
         model = PeftModel.from_pretrained(model, checkpoint_path)
     else:
-        try:
-            model = AutoModelForImageTextToText.from_pretrained(checkpoint_path)
-        except Exception:
-            model = AutoModelForVision2Seq.from_pretrained(checkpoint_path)
+        model = _load_vision_model_from_pretrained(checkpoint_path)
     
     return model
 
