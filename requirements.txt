@@ -15,11 +15,13 @@ peft==0.18.1
 trl==0.29.0
 datasets==4.6.1
 deepspeed==0.18.7
+bitsandbytes>=0.46.1
 
 # Core utilities
 numpy==2.1.2
 Pillow==10.2.0
 tqdm==4.66.5
+requests>=2.32,<3
 
 # Logging / tracking
 tensorboard>=2.16,<3
@@ -35,9 +37,5 @@ pytest>=8,<9
 black>=24,<26
 
 # Optional extras
-# bitsandbytes can be useful for quantized loading / QLoRA, but it is more brittle
-# across new GPU architectures and is not required for the current full-precision path.
-bitsandbytes>=0.43
-#
 # flash-attn is optional and should be installed separately if you specifically want it:
 # pip install flash-attn --no-build-isolation

@@ -12,8 +12,6 @@ Uses TRL library for implementation.
 """
 
 import argparse
-import contextlib
-import inspect
 import logging
 import os
 import sys
@@ -24,62 +22,23 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import TrainingArguments
 
 from src.collator import PreferenceDataCollator
 from src.config import AlignmentConfig, Config
 from src.dataset import PreferenceDataset
-from src.utils import load_model_and_processor, set_seed, setup_logging
-
-
-class TextOnlyVisionProcessorShim:
-    """
-    Minimal shim for TRL DPOTrainer vision preprocessing path.
-    Accepts `images=` but tokenizes only text using an underlying tokenizer.
-    """
-
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def __getattr__(self, name):
-        return getattr(self.tokenizer, name)
-
-    def __call__(self, *args, **kwargs):
-        text = kwargs.pop("text", None)
-        kwargs.pop("images", None)
-        if text is None and args:
-            return self.tokenizer(*args, **kwargs)
-        return self.tokenizer(text, **kwargs)
-
-
-@contextlib.contextmanager
-def force_trl_dpo_text_mode_for_model(model):
-    """
-    TRL DPOTrainer (newer versions) auto-detects vision-language models and requires
-    multimodal datasets/processors. For smoke tests we may intentionally pass a
-    text-only fallback dataset. This context temporarily disables the vision branch
-    for the current model_type during trainer initialization.
-    """
-    try:
-        import trl.trainer.dpo_trainer as dpo_mod
-    except Exception:
-        yield
-        return
-
-    mapping = getattr(dpo_mod, "MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES", None)
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if mapping is None or model_type is None or model_type not in mapping:
-        yield
-        return
-
-    original = dict(mapping)
-    try:
-        mapping.pop(model_type, None)
-        yield
-    finally:
-        mapping.clear()
-        mapping.update(original)
+from src.training_runtime import (
+    apply_lora_if_enabled,
+    build_trainer,
+    configure_torch_runtime,
+    create_training_arguments,
+    ensure_trl_fsdp_compat,
+    filter_available_reporters,
+    force_trl_dpo_text_mode_for_model,
+    load_model_with_attention_fallback,
+    parse_report_to,
+    resolve_distributed_config_for_model,
+)
+from src.utils import set_seed, setup_logging
 
 
 def parse_args():
@@ -108,7 +67,7 @@ def parse_args():
     )
     parser.add_argument("--config", type=str, default=None, help="Path to config JSON file")
     parser.add_argument(
-        "--beta", type=float, default=0.1, help="Beta parameter for DPO/KTO/ORPO"
+        "--beta", type=float, default=None, help="Beta parameter for DPO/KTO/ORPO"
     )
     parser.add_argument(
         "--reference_free",
@@ -116,40 +75,46 @@ def parse_args():
         default=False,
         help="Enable reference-free DPO smoke testing (skips loading ref model)",
     )
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Per-device batch size")
+    parser.add_argument("--num_epochs", type=int, default=None, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=None, help="Per-device batch size")
     parser.add_argument(
-        "--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps"
+        "--gradient_accumulation_steps", type=int, default=None, help="Gradient accumulation steps"
     )
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--learning_rate", type=float, default=None, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument(
         "--use_lora",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Enable or disable LoRA adapters",
     )
-    parser.add_argument("--lora_r", type=int, default=64, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=128, help="LoRA alpha")
     parser.add_argument(
-        "--max_images_per_case", type=int, default=4, help="Maximum images to load per case"
+        "--use_qlora",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable 4-bit QLoRA loading",
+    )
+    parser.add_argument("--lora_r", type=int, default=None, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="LoRA alpha")
+    parser.add_argument(
+        "--max_images_per_case", type=int, default=None, help="Maximum images to load per case"
     )
     parser.add_argument(
         "--dpo_max_prompt_length",
         type=int,
-        default=2048,
+        default=None,
         help="Max prompt length for TRL DPO tokenization (important for multimodal prompts)",
     )
     parser.add_argument(
         "--dpo_max_length",
         type=int,
-        default=3072,
+        default=None,
         help="Max total length for TRL DPO concatenated prompt+completion",
     )
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default=None,
         help="Comma-separated trackers (e.g. tensorboard,wandb) or 'none'",
     )
     parser.add_argument(
@@ -162,116 +127,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def ensure_trl_fsdp_compat():
-    """
-    TRL>=0.29 imports `torch.distributed.fsdp.FSDPModule`, which is not exposed
-    in some torch builds (e.g. 2.5.x). Provide a best-effort alias.
-    """
-    try:
-        import torch.distributed.fsdp as fsdp_mod
-    except Exception:
-        return
-
-    if hasattr(fsdp_mod, "FSDPModule"):
-        return
-    if hasattr(fsdp_mod, "FullyShardedDataParallel"):
-        fsdp_mod.FSDPModule = fsdp_mod.FullyShardedDataParallel
-
-
-def parse_report_to(report_to: str) -> List[str]:
-    value = report_to.strip().lower()
-    if value in {"", "none", "null", "false"}:
-        return []
-    return [item.strip() for item in report_to.split(",") if item.strip()]
-
-
-def supports_bf16() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
-    return bool(bf16_supported()) if callable(bf16_supported) else False
-
-
-def create_training_arguments(
-    args: AlignmentConfig,
-    output_dir: str,
-    report_to: List[str],
-    eval_dataset: Optional[Any],
-    args_cls=TrainingArguments,
-) -> TrainingArguments:
-    sig = inspect.signature(args_cls.__init__).parameters
-    eval_mode = "steps" if eval_dataset is not None else "no"
-    bf16 = supports_bf16()
-    fp16 = torch.cuda.is_available() and not bf16
-
-    kwargs: Dict[str, Any] = {
-        "output_dir": output_dir,
-        "num_train_epochs": args.num_train_epochs,
-        "per_device_train_batch_size": args.per_device_train_batch_size,
-        "per_device_eval_batch_size": args.per_device_train_batch_size,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "learning_rate": args.learning_rate,
-        "warmup_ratio": 0.1,
-        "lr_scheduler_type": "cosine",
-        "logging_steps": args.logging_steps,
-        "save_strategy": "steps",
-        "save_steps": args.save_steps,
-        "save_total_limit": 3,
-        "bf16": bf16,
-        "fp16": fp16,
-        "gradient_checkpointing": True,
-        "remove_unused_columns": False,
-        "report_to": report_to,
-    }
-
-    if "eval_strategy" in sig:
-        kwargs["eval_strategy"] = eval_mode
-    elif "evaluation_strategy" in sig:
-        kwargs["evaluation_strategy"] = eval_mode
-
-    if eval_dataset is not None:
-        kwargs["eval_steps"] = 100
-
-    return args_cls(**kwargs)
-
-
-def build_trainer(
-    trainer_cls,
-    model,
-    training_args,
-    train_dataset,
-    eval_dataset,
-    processor,
-    extra_kwargs: Optional[Dict[str, Any]] = None,
-    data_collator: Optional[Any] = None,
-):
-    sig = inspect.signature(trainer_cls.__init__).parameters
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "args": training_args,
-        "train_dataset": train_dataset,
-    }
-
-    if eval_dataset is not None and "eval_dataset" in sig:
-        kwargs["eval_dataset"] = eval_dataset
-    elif "eval_dataset" in sig:
-        kwargs["eval_dataset"] = None
-
-    if "processing_class" in sig:
-        kwargs["processing_class"] = processor
-    elif "tokenizer" in sig:
-        kwargs["tokenizer"] = getattr(processor, "tokenizer", processor)
-
-    if data_collator is not None and "data_collator" in sig:
-        kwargs["data_collator"] = data_collator
-
-    for key, value in (extra_kwargs or {}).items():
-        if value is not None and key in sig:
-            kwargs[key] = value
-
-    return trainer_cls(**kwargs)
-
-
 def setup_dpo_trainer(
     model,
     ref_model,
@@ -279,6 +134,7 @@ def setup_dpo_trainer(
     eval_dataset,
     processor,
     args: AlignmentConfig,
+    distributed,
     output_dir: str,
     report_to: List[str],
     data_collator: Optional[Any] = None,
@@ -292,7 +148,12 @@ def setup_dpo_trainer(
         raise ImportError("TRL library not installed. Run: pip install trl") from exc
 
     training_args = create_training_arguments(
-        args, output_dir, report_to, eval_dataset, args_cls=DPOConfig
+        train_config=args,
+        distributed=distributed,
+        output_dir=output_dir,
+        report_to=report_to,
+        eval_dataset=eval_dataset,
+        args_cls=DPOConfig,
     )
     if dpo_max_prompt_length is not None and hasattr(training_args, "max_prompt_length"):
         training_args.max_prompt_length = dpo_max_prompt_length
@@ -325,6 +186,7 @@ def setup_kto_trainer(
     eval_dataset,
     processor,
     args: AlignmentConfig,
+    distributed,
     output_dir: str,
     report_to: List[str],
     data_collator: Optional[Any] = None,
@@ -335,7 +197,13 @@ def setup_kto_trainer(
     except ImportError as exc:
         raise ImportError("TRL library not installed. Run: pip install trl") from exc
 
-    training_args = create_training_arguments(args, output_dir, report_to, eval_dataset)
+    training_args = create_training_arguments(
+        train_config=args,
+        distributed=distributed,
+        output_dir=output_dir,
+        report_to=report_to,
+        eval_dataset=eval_dataset,
+    )
     return build_trainer(
         trainer_cls=KTOTrainer,
         model=model,
@@ -358,6 +226,7 @@ def setup_orpo_trainer(
     eval_dataset,
     processor,
     args: AlignmentConfig,
+    distributed,
     output_dir: str,
     report_to: List[str],
     data_collator: Optional[Any] = None,
@@ -368,7 +237,13 @@ def setup_orpo_trainer(
     except ImportError as exc:
         raise ImportError("TRL library not installed. Run: pip install trl") from exc
 
-    training_args = create_training_arguments(args, output_dir, report_to, eval_dataset)
+    training_args = create_training_arguments(
+        train_config=args,
+        distributed=distributed,
+        output_dir=output_dir,
+        report_to=report_to,
+        eval_dataset=eval_dataset,
+    )
     return build_trainer(
         trainer_cls=ORPOTrainer,
         model=model,
@@ -391,6 +266,7 @@ def setup_grpo_trainer(
     eval_dataset,
     processor,
     args: AlignmentConfig,
+    distributed,
     output_dir: str,
     report_to: List[str],
 ):
@@ -402,7 +278,13 @@ def setup_grpo_trainer(
             "TRL library with GRPO support not installed. Run: pip install trl"
         ) from exc
 
-    training_args = create_training_arguments(args, output_dir, report_to, eval_dataset)
+    training_args = create_training_arguments(
+        train_config=args,
+        distributed=distributed,
+        output_dir=output_dir,
+        report_to=report_to,
+        eval_dataset=eval_dataset,
+    )
 
     def reward_func(prompts, completions, **kwargs):
         """Placeholder reward: replace with task-specific clinical scoring."""
@@ -529,39 +411,6 @@ def prepare_multimodal_pairwise_hf_dataset(raw_dataset, processor=None):
     return HFDataset.from_list(rows, features=features)
 
 
-def load_with_attention_fallback(model_path: str, model_config: Dict[str, Any], logger):
-    """Try requested attention backend, fallback if unavailable."""
-    tried = []
-    order = [
-        model_config.get("attn_implementation", "flash_attention_2"),
-        "sdpa",
-        "eager",
-    ]
-
-    for attn_impl in order:
-        if attn_impl in tried:
-            continue
-        tried.append(attn_impl)
-
-        current_config = dict(model_config)
-        current_config["attn_implementation"] = attn_impl
-        try:
-            model, processor = load_model_and_processor(
-                model_name_or_path=model_path,
-                model_config=current_config,
-                use_qlora=False,
-            )
-            if attn_impl != model_config.get("attn_implementation"):
-                logger.warning(
-                    "Fell back to attention backend '%s'", attn_impl
-                )
-            return model, processor
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Failed loading with attn '%s': %s", attn_impl, exc)
-
-    raise RuntimeError("Could not load model with any supported attention backend")
-
-
 def main():
     args = parse_args()
     ensure_trl_fsdp_compat()
@@ -579,59 +428,73 @@ def main():
     logger.info("Alignment Training: %s", args.alignment_type.upper())
     logger.info("=" * 60)
 
-    set_seed(args.seed)
-    report_to = parse_report_to(args.report_to)
-
     config = Config()
     if args.config and os.path.exists(args.config):
         config = Config.from_json(args.config)
+    configure_torch_runtime(config.distributed, logger)
+    set_seed(args.seed if args.seed is not None else config.alignment.seed)
+    report_to = filter_available_reporters(
+        parse_report_to(
+            args.report_to
+            if args.report_to is not None
+            else config.alignment.report_to
+        ),
+        logger=logger,
+    )
 
     config.alignment.alignment_type = args.alignment_type
     config.alignment.output_dir = args.output_dir
-    config.alignment.beta = args.beta
+    if args.beta is not None:
+        config.alignment.beta = args.beta
     config.alignment.reference_free = args.reference_free
-    config.alignment.num_train_epochs = args.num_epochs
-    config.alignment.per_device_train_batch_size = args.batch_size
-    config.alignment.gradient_accumulation_steps = args.gradient_accumulation_steps
-    config.alignment.learning_rate = args.learning_rate
+    if args.num_epochs is not None:
+        config.alignment.num_train_epochs = args.num_epochs
+    if args.batch_size is not None:
+        config.alignment.per_device_train_batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        config.alignment.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.learning_rate is not None:
+        config.alignment.learning_rate = args.learning_rate
+    config.alignment.report_to = report_to
+    if args.seed is not None:
+        config.alignment.seed = args.seed
+    config.model.model_name_or_path = args.model_path
+    config.model.attn_implementation = args.attn_implementation
+    if args.use_lora is not None:
+        config.lora.use_lora = args.use_lora
+    if args.lora_r is not None:
+        config.lora.r = args.lora_r
+    if args.lora_alpha is not None:
+        config.lora.lora_alpha = args.lora_alpha
+    if args.use_qlora is not None:
+        config.model.use_qlora = args.use_qlora
     config.to_json(os.path.join(args.output_dir, "config.json"))
 
     logger.info("Loading model from %s", args.model_path)
-    model_config = {
-        "torch_dtype": "bfloat16",
-        "attn_implementation": args.attn_implementation,
-        "trust_remote_code": True,
-    }
-
-    model, processor = load_with_attention_fallback(args.model_path, model_config, logger)
-
-    if args.use_lora:
-        logger.info("Applying LoRA adapters...")
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    model, processor = load_model_with_attention_fallback(
+        model_name_or_path=args.model_path,
+        model_config=config.model,
+        use_qlora=config.model.use_qlora,
+        logger=logger,
+    )
+    model = apply_lora_if_enabled(model, config.lora, logger)
+    distributed_config = resolve_distributed_config_for_model(
+        model,
+        config.distributed,
+        logger=logger,
+    )
 
     ref_model = None
     if args.alignment_type in {"dpo", "grpo"} and not (
         args.alignment_type == "dpo" and args.reference_free
     ):
         logger.info("Loading reference model...")
-        ref_model, _ = load_with_attention_fallback(args.model_path, model_config, logger)
+        ref_model, _ = load_model_with_attention_fallback(
+            model_name_or_path=args.model_path,
+            model_config=config.model,
+            use_qlora=False,
+            logger=logger,
+        )
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
@@ -649,7 +512,11 @@ def main():
         jsonl_path=args.preference_data,
         images_root=args.images_root,
         processor=processor,
-        max_images_per_case=args.max_images_per_case,
+        max_images_per_case=(
+            args.max_images_per_case
+            if args.max_images_per_case is not None
+            else config.data.max_images_per_case
+        ),
         format_type=format_type,
     )
     logger.info("Train dataset size: %d", len(raw_dataset))
@@ -706,11 +573,20 @@ def main():
             eval_dataset=None,
             processor=trainer_processing,
             args=config.alignment,
+            distributed=distributed_config,
             output_dir=args.output_dir,
             report_to=report_to,
             data_collator=data_collator,
-            dpo_max_prompt_length=args.dpo_max_prompt_length,
-            dpo_max_length=args.dpo_max_length,
+            dpo_max_prompt_length=(
+                args.dpo_max_prompt_length
+                if args.dpo_max_prompt_length is not None
+                else config.data.max_prompt_length
+            ),
+            dpo_max_length=(
+                args.dpo_max_length
+                if args.dpo_max_length is not None
+                else config.data.max_seq_length
+            ),
         )
     elif args.alignment_type == "kto":
         trainer = setup_kto_trainer(
@@ -719,6 +595,7 @@ def main():
             eval_dataset=None,
             processor=trainer_processing,
             args=config.alignment,
+            distributed=distributed_config,
             output_dir=args.output_dir,
             report_to=report_to,
             data_collator=None,
@@ -730,6 +607,7 @@ def main():
             eval_dataset=None,
             processor=trainer_processing,
             args=config.alignment,
+            distributed=distributed_config,
             output_dir=args.output_dir,
             report_to=report_to,
             data_collator=data_collator,
@@ -742,6 +620,7 @@ def main():
             eval_dataset=None,
             processor=trainer_processing,
             args=config.alignment,
+            distributed=distributed_config,
             output_dir=args.output_dir,
             report_to=report_to,
         )

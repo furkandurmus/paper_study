@@ -103,6 +103,46 @@ Your JSONL files should have this schema:
 
 ## Usage
 
+## Systematic Training Pipeline
+
+Training is now organized around shared runtime/config logic so the same stack can be
+used for:
+
+- SFT and alignment
+- single GPU, DDP, or FSDP
+- full finetuning, LoRA, or QLoRA
+- different multimodal models via `model.model_name_or_path`
+
+Key config sections:
+
+- `model`: model path, dtype, attention backend, QLoRA settings
+- `lora`: LoRA on/off and target modules
+- `distributed`: `single`, `ddp`, or `fsdp` plus FSDP wrapping options
+- `training` / `alignment`: task-specific optimization settings
+
+Example presets:
+
+- [configs/sft_fsdp_lora_example.json](/workspace/stroke_study/paper_study/configs/sft_fsdp_lora_example.json)
+- [configs/sft_qlora_single_gpu_example.json](/workspace/stroke_study/paper_study/configs/sft_qlora_single_gpu_example.json)
+- [configs/dpo_fsdp_fullft_example.json](/workspace/stroke_study/paper_study/configs/dpo_fsdp_fullft_example.json)
+
+Multi-GPU launch examples:
+
+```bash
+torchrun --nproc_per_node=2 scripts/train_sft.py \
+  --config configs/sft_fsdp_lora_example.json
+```
+
+```bash
+torchrun --nproc_per_node=2 scripts/train_alignment.py \
+  --config configs/dpo_fsdp_fullft_example.json \
+  --alignment_type dpo \
+  --model_path /path/to/model \
+  --preference_data data/prefs.jsonl \
+  --images_root data/images \
+  --output_dir outputs/dpo_fsdp
+```
+
 ### 1. Supervised Fine-Tuning (SFT)
 
 Train the base model on your radiology reports:

@@ -1,0 +1,78 @@
+{
+  "model": {
+    "model_name_or_path": "/workspace/stroke_study/models/llava-hf/llava-onevision-qwen2-0.5b-si-hf",
+    "model_type": "auto",
+    "trust_remote_code": true,
+    "torch_dtype": "bfloat16",
+    "attn_implementation": "eager",
+    "use_qlora": true,
+    "load_in_4bit": true,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_use_double_quant": true,
+    "bnb_4bit_quant_type": "nf4"
+  },
+  "lora": {
+    "use_lora": true,
+    "r": 64,
+    "lora_alpha": 128,
+    "lora_dropout": 0.05,
+    "bias": "none",
+    "task_type": "CAUSAL_LM",
+    "target_modules": [
+      "q_proj", "k_proj", "v_proj", "o_proj",
+      "gate_proj", "up_proj", "down_proj"
+    ],
+    "modules_to_save": ["embed_tokens", "lm_head"]
+  },
+  "distributed": {
+    "strategy": "single",
+    "ddp_find_unused_parameters": false,
+    "fsdp": [],
+    "fsdp_min_num_params": 0,
+    "fsdp_transformer_layer_cls_to_wrap": [],
+    "fsdp_backward_prefetch": "backward_pre",
+    "fsdp_forward_prefetch": false,
+    "fsdp_cpu_ram_efficient_loading": true,
+    "fsdp_offload_params": false,
+    "fsdp_sync_module_states": true,
+    "fsdp_use_orig_params": true,
+    "fsdp_activation_checkpointing": false
+  },
+  "data": {
+    "train_jsonl": "dummy_data/sft_from_prefs_5x.jsonl",
+    "val_jsonl": null,
+    "test_jsonl": null,
+    "images_root": "dummy_data",
+    "image_size": 448,
+    "max_images_per_case": 1,
+    "max_seq_length": 1536,
+    "max_prompt_length": 768,
+    "max_response_length": 512
+  },
+  "training": {
+    "output_dir": "outputs/sft_qlora_single",
+    "num_train_epochs": 1,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "lr_scheduler_type": "cosine",
+    "logging_steps": 10,
+    "eval_steps": 100,
+    "save_steps": 500,
+    "save_total_limit": 3,
+    "eval_strategy": "no",
+    "load_best_model_at_end": false,
+    "metric_for_best_model": "eval_loss",
+    "greater_is_better": false,
+    "seed": 42,
+    "bf16": true,
+    "fp16": false,
+    "gradient_checkpointing": true,
+    "dataloader_num_workers": 4,
+    "remove_unused_columns": false,
+    "report_to": ["tensorboard"]
+  }
+}

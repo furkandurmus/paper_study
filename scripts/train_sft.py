@@ -18,18 +18,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 from transformers import (
     Trainer,
-    TrainingArguments,
-    DataCollatorForSeq2Seq
 )
-from trl import SFTTrainer, SFTConfig
 
 from src.config import Config
 from src.dataset import CTAMIPDataset
 from src.collator import SFTDataCollator
+from src.training_runtime import (
+    apply_lora_if_enabled,
+    configure_torch_runtime,
+    create_training_arguments,
+    ensure_trl_fsdp_compat,
+    filter_available_reporters,
+    load_model_with_attention_fallback,
+    parse_report_to,
+    resolve_distributed_config_for_model,
+)
 from src.utils import (
     setup_logging,
     set_seed,
-    load_model_and_processor,
     create_output_directory
 )
 
@@ -89,6 +95,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    ensure_trl_fsdp_compat()
     
     # Load config
     if os.path.exists(args.config):
@@ -119,6 +126,7 @@ def main():
         log_file=os.path.join(output_dir, "training.log")
     )
     logger = logging.getLogger(__name__)
+    configure_torch_runtime(config.distributed, logger)
     
     # Set seed
     set_seed(config.training.seed)
@@ -130,11 +138,17 @@ def main():
     
     # Load model and processor
     logger.info("Loading model and processor...")
-    model, processor = load_model_and_processor(
+    model, processor = load_model_with_attention_fallback(
         model_name_or_path=config.model.model_name_or_path,
-        model_config=config.model.__dict__,
-        lora_config=config.lora.__dict__,
-        use_qlora=config.model.use_qlora
+        model_config=config.model,
+        use_qlora=config.model.use_qlora,
+        logger=logger,
+    )
+    model = apply_lora_if_enabled(model, config.lora, logger)
+    distributed_config = resolve_distributed_config_for_model(
+        model,
+        config.distributed,
+        logger=logger,
     )
     
     # Load datasets
@@ -168,33 +182,27 @@ def main():
     )
     
     # Setup training arguments
-    training_args = TrainingArguments(
+    report_to = filter_available_reporters(
+        parse_report_to(config.training.report_to),
+        logger=logger,
+    )
+
+    training_args = create_training_arguments(
+        train_config=config.training,
+        distributed=distributed_config,
         output_dir=output_dir,
-        num_train_epochs=config.training.num_train_epochs,
-        per_device_train_batch_size=config.training.per_device_train_batch_size,
-        per_device_eval_batch_size=config.training.per_device_eval_batch_size,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        learning_rate=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-        warmup_ratio=config.training.warmup_ratio,
-        lr_scheduler_type=config.training.lr_scheduler_type,
-        logging_steps=config.training.logging_steps,
-        eval_strategy=config.training.eval_strategy if eval_dataset else "no",
-        eval_steps=config.training.eval_steps if eval_dataset else None,
-        save_steps=config.training.save_steps,
-        save_total_limit=config.training.save_total_limit,
-        load_best_model_at_end=config.training.load_best_model_at_end and eval_dataset is not None,
-        metric_for_best_model=config.training.metric_for_best_model,
-        greater_is_better=config.training.greater_is_better,
-        bf16=config.training.bf16,
-        fp16=config.training.fp16,
-        gradient_checkpointing=config.training.gradient_checkpointing,
-        dataloader_num_workers=config.training.dataloader_num_workers,
-        remove_unused_columns=config.training.remove_unused_columns,
-        report_to=config.training.report_to,
-        seed=config.training.seed,
-        # For SFT with images
-        dataloader_prefetch_factor=2 if config.training.dataloader_num_workers > 0 else None,
+        report_to=report_to,
+        eval_dataset=eval_dataset,
+        extra_kwargs={
+            "load_best_model_at_end": (
+                config.training.load_best_model_at_end and eval_dataset is not None
+            ),
+            "metric_for_best_model": config.training.metric_for_best_model,
+            "greater_is_better": config.training.greater_is_better,
+            "dataloader_prefetch_factor": (
+                2 if config.training.dataloader_num_workers > 0 else None
+            ),
+        },
     )
     
     # Create trainer

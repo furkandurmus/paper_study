@@ -11,7 +11,7 @@ import json
 class ModelConfig:
     """Model configuration."""
     model_name_or_path: str = "Qwen/Qwen2-VL-7B-Instruct"
-    model_type: str = "qwen2-vl"  # qwen2-vl, qwen3-vl, smolvlm
+    model_type: str = "auto"
     trust_remote_code: bool = True
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "flash_attention_2"
@@ -22,6 +22,25 @@ class ModelConfig:
     bnb_4bit_compute_dtype: str = "bfloat16"
     bnb_4bit_use_double_quant: bool = True
     bnb_4bit_quant_type: str = "nf4"
+
+
+@dataclass
+class DistributedConfig:
+    """Distributed/runtime strategy configuration."""
+    strategy: str = "single"  # single, ddp, fsdp
+    ddp_find_unused_parameters: Optional[bool] = None
+
+    # FSDP options mirror Hugging Face TrainingArguments.
+    fsdp: List[str] = field(default_factory=list)
+    fsdp_min_num_params: int = 0
+    fsdp_transformer_layer_cls_to_wrap: List[str] = field(default_factory=list)
+    fsdp_backward_prefetch: str = "backward_pre"
+    fsdp_forward_prefetch: bool = False
+    fsdp_cpu_ram_efficient_loading: bool = True
+    fsdp_offload_params: bool = False
+    fsdp_sync_module_states: bool = True
+    fsdp_use_orig_params: bool = True
+    fsdp_activation_checkpointing: bool = False
 
 
 @dataclass
@@ -131,8 +150,19 @@ class AlignmentConfig:
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 8
     learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    lr_scheduler_type: str = "cosine"
     logging_steps: int = 10
     save_steps: int = 500
+    save_total_limit: int = 3
+    seed: int = 42
+    bf16: bool = True
+    fp16: bool = False
+    gradient_checkpointing: bool = True
+    dataloader_num_workers: int = 4
+    remove_unused_columns: bool = False
+    report_to: List[str] = field(default_factory=lambda: ["tensorboard"])
 
 
 @dataclass
@@ -158,6 +188,7 @@ class Config:
     """Main configuration container."""
     model: ModelConfig = field(default_factory=ModelConfig)
     lora: LoRAConfig = field(default_factory=LoRAConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
@@ -173,6 +204,7 @@ class Config:
         return cls(
             model=ModelConfig(**data.get("model", {})),
             lora=LoRAConfig(**data.get("lora", {})),
+            distributed=DistributedConfig(**data.get("distributed", {})),
             data=DataConfig(**data.get("data", {})),
             training=TrainingConfig(**data.get("training", {})),
             generation=GenerationConfig(**data.get("generation", {})),
@@ -185,6 +217,7 @@ class Config:
         data = {
             "model": self.model.__dict__,
             "lora": self.lora.__dict__,
+            "distributed": self.distributed.__dict__,
             "data": self.data.__dict__,
             "training": self.training.__dict__,
             "generation": self.generation.__dict__,
