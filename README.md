@@ -337,50 +337,9 @@ The [`scripts/train_alignment.py`](scripts/train_alignment.py) file contains stu
 
 Edit [`src/scoring.py`](src/scoring.py) and update [`scripts/evaluate.py`](scripts/evaluate.py) to include them.
 
-## Hardware Requirements
-
-**Minimum (QLoRA):**
-- GPU: 1x A10G (24GB) or RTX 3090 (24GB)
-- RAM: 32GB
-- Storage: 100GB
-
-**Recommended (Full Fine-tuning):**
-- GPU: 1x A100 (40GB/80GB) or 2x A10G
-- RAM: 64GB
-- Storage: 200GB
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@software{cta_mip_vlm,
-  title={CTA-MIP VLM Training Framework},
-  author={Your Name},
-  year={2024}
-}
-```
 
 ## License
 
 MIT License - See LICENSE file for details.
 
-## Troubleshooting
 
-**Out of Memory:**
-- Enable QLoRA: `use_qlora: true`
-- Reduce batch size
-- Enable gradient checkpointing
-- Use smaller model (SmolVLM-256M instead of Qwen2-VL-7B)
-
-**Flash Attention Not Available:**
-- Install: `pip install flash-attn --no-build-isolation`
-- Or change `attn_implementation` to `eager`
-
-**Image Loading Errors:**
-- Verify image paths are relative to `images_root`
-- Check image files exist and are valid PNG/JPG
-
-## Contact
-
-For questions or issues, please open a GitHub issue.
