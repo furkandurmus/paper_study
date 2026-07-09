@@ -179,7 +179,7 @@ class ClinicalRubricScorer:
         "pca", "posterior cerebral artery",
         "ica", "internal carotid",
         "vertebral", "basilar",
-        "pca", "posterior circulation"
+        "posterior circulation"
     ]
     
     LATERALITY_TERMS = ["left", "right", "bilateral", "midline"]
@@ -444,14 +444,314 @@ def llm_judge_score(
     judge_model: Optional[str] = None
 ) -> float:
     """
-    Placeholder for LLM-as-judge scoring.
-    
-    TODO: Implement actual LLM judge integration.
+    DEPRECATED text-only placeholder. Kept for backwards compatibility.
+
+    For a real, image-grounded judge use `src.reward.LLMJudge`, which sends the
+    CTA images to a multimodal model. This function intentionally raises if called
+    without a backend so it can no longer silently inject random rewards.
     """
-    # Placeholder - returns random score for now
-    # In production, this would call an LLM API
-    import random
-    return random.uniform(0.5, 1.0)
+    raise NotImplementedError(
+        "llm_judge_score is a non-functional placeholder. Use src.reward.LLMJudge "
+        "(image-grounded) or src.reward.CompositeReward instead."
+    )
+
+
+# ============================================================================
+# FACT-BASED (LABEL-GROUNDED) SCORING
+# ============================================================================
+#
+# These functions score a generated report against the *structured case labels*
+# (e.g. {"anomaly_present": true, "main_region": "Right MCA"}) rather than against
+# the reference string. This makes the reward depend on diagnostic correctness
+# (presence of large-vessel occlusion, correct vessel, correct side, calibrated
+# uncertainty) instead of lexical overlap.
+
+# Canonical vessel vocabulary. Each canonical key maps to surface forms / regexes.
+# Order matters: more specific names are matched first.
+_VESSEL_PATTERNS: List[Tuple[str, str]] = [
+    ("ica", r"\b(ica|internal carotid(?: artery)?)\b"),
+    ("mca", r"\b(mca|middle cerebral(?: artery)?|m1|m2)\b"),
+    ("aca", r"\b(aca|anterior cerebral(?: artery)?|a1|a2)\b"),
+    ("pca", r"\b(pca|posterior cerebral(?: artery)?|p1|p2)\b"),
+    ("basilar", r"\b(basilar(?: artery)?)\b"),
+    ("vertebral", r"\b(vertebral(?: artery)?|v4)\b"),
+]
+
+# Positive findings indicating a large-vessel / acute abnormality.
+_POSITIVE_FINDING_PATTERNS = [
+    r"\bocclusion\b", r"\boccluded\b", r"\bocclusive\b",
+    r"\bthrombus\b", r"\bthrombosis\b", r"\bembol", r"\bclot\b",
+    r"\bcut[- ]?off\b", r"\bfilling defect\b", r"\bnon[- ]?opacif",
+    r"\blarge[- ]vessel occlusion\b", r"\blvo\b",
+    r"\bhigh[- ]grade stenosis\b", r"\bflow[- ]limiting stenosis\b",
+]
+
+# Explicit negation / normal statements.
+_NEGATIVE_FINDING_PATTERNS = [
+    r"\bno (?:definite |evidence of )?(?:proximal |large[- ]vessel )?(?:occlusion|cutoff|filling defect|thrombus)\b",
+    r"\bno large[- ]vessel occlusion\b",
+    r"\bno lvo\b",
+    r"\bpatent\b", r"\bunremarkable\b", r"\bno acute\b",
+    r"\bno significant\b", r"\bwithin normal limits\b",
+    r"\bnormal (?:vascular|opacification|caliber)\b",
+]
+
+_HEDGE_PATTERNS = [
+    r"\blimited\b", r"\bpartial(?:ly)?\b", r"\bcorrelate\b",
+    r"\bmay\b", r"\bmight\b", r"\bpossible\b", r"\bpossibly\b",
+    r"\bsuggestive\b", r"\bcannot (?:exclude|rule out)\b",
+    r"\bnot excluded\b", r"\bif clinically\b", r"\bequivocal\b",
+]
+
+
+def _find_any(patterns: List[str], text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def _detect_vessels(text: str) -> List[str]:
+    found = []
+    for key, pat in _VESSEL_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE) and key not in found:
+            found.append(key)
+    return found
+
+
+def _detect_side(text: str) -> Optional[str]:
+    """Return 'left', 'right', 'bilateral', or None using word-boundary matches.
+
+    `\\bright\\b` already excludes 'rightward'/'upright' (no word boundary inside
+    the longer token), so no special-casing is needed.
+    """
+    t = text.lower()
+    if re.search(r"\bbilateral\b", t):
+        return "bilateral"
+    has_left = bool(re.search(r"\bleft\b", t))
+    has_right = bool(re.search(r"\bright\b", t))
+    if has_left and has_right:
+        return None  # ambiguous; caller decides
+    if has_left:
+        return "left"
+    if has_right:
+        return "right"
+    return None
+
+
+_NEGATION_CUE = re.compile(
+    r"\b(no|not|without|negative|absence|absent|patent|unremarkable|normal|none|"
+    r"rule out|ruled out|exclude[ds]?)\b",
+    re.IGNORECASE,
+)
+
+
+def _polarity(text: str) -> Tuple[bool, bool]:
+    """
+    Clause-level polarity for positive findings.
+
+    Splits the report into clauses and, for each clause containing a positive
+    finding term, checks whether the *same clause* carries a negation cue. This
+    correctly reads "No large vessel occlusion" as negative while reading
+    "Acute occlusion of the right MCA" as affirmative.
+
+    Returns (affirmative, negated_present).
+    """
+    affirmative = False
+    negated_present = False
+    for clause in re.split(r"[.;:,\n]", text):
+        if not _find_any(_POSITIVE_FINDING_PATTERNS, clause):
+            continue
+        if _NEGATION_CUE.search(clause):
+            negated_present = True
+        else:
+            affirmative = True
+    return affirmative, negated_present
+
+
+def parse_report_claims(text: str) -> Dict[str, Any]:
+    """
+    Extract structured claims from a free-text report.
+
+    Returns dict with:
+        asserts_positive: bool   (claims an occlusion/LVO-type finding)
+        asserts_negative: bool   (explicitly states normal/no occlusion)
+        vessels: List[str]       (canonical vessel keys mentioned)
+        side: Optional[str]      ('left'|'right'|'bilateral'|None)
+        hedged: bool             (uses calibrated uncertainty language)
+        overconfident: int       (count of overconfident words)
+    """
+    affirmative, negated_present = _polarity(text)
+    asserts_positive = affirmative
+    asserts_negative = negated_present or _find_any(_NEGATIVE_FINDING_PATTERNS, text)
+
+    return {
+        "asserts_positive": asserts_positive,
+        "asserts_negative": asserts_negative,
+        "vessels": _detect_vessels(text),
+        "side": _detect_side(text),
+        "hedged": _find_any(_HEDGE_PATTERNS, text),
+        "overconfident": sum(
+            1 for w in ClinicalRubricScorer.OVERCONFIDENT_WORDS if w in text.lower()
+        ),
+    }
+
+
+def parse_labels(labels: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Normalize structured case labels into {anomaly, vessel, side}.
+
+    Accepts flexible schemas, e.g.:
+        {"anomaly_present": true, "main_region": "Right MCA"}
+        {"anomaly_present": false}
+        {"vessel": "mca", "side": "right", "anomaly_present": true}
+    Returns {anomaly: Optional[bool], vessel: Optional[str], side: Optional[str]}.
+    """
+    out = {"anomaly": None, "vessel": None, "side": None}
+    if not labels or not isinstance(labels, dict):
+        return out
+
+    if "anomaly_present" in labels:
+        out["anomaly"] = bool(labels["anomaly_present"])
+    elif "anomaly" in labels:
+        out["anomaly"] = bool(labels["anomaly"])
+
+    region_text = " ".join(
+        str(labels.get(k, "")) for k in ("main_region", "region", "vessel", "side", "laterality")
+    )
+    vessels = _detect_vessels(region_text)
+    if vessels:
+        out["vessel"] = vessels[0]
+    elif labels.get("vessel"):
+        out["vessel"] = str(labels["vessel"]).lower()
+
+    side = _detect_side(region_text)
+    if side:
+        out["side"] = side
+    elif labels.get("side"):
+        out["side"] = str(labels["side"]).lower()
+    elif labels.get("laterality"):
+        out["side"] = str(labels["laterality"]).lower()
+
+    return out
+
+
+def fact_based_report(
+    prediction: str,
+    labels: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Score a prediction against structured case labels (diagnostic correctness).
+
+    Returns a dict:
+        {
+          "available": bool,        # False if labels carry no usable ground truth
+          "score": float in [0,1],  # composite fact score (only meaningful if available)
+          "components": {...},      # per-axis sub-scores
+          "claims": {...},          # parsed prediction claims
+          "labels": {...},          # normalized labels
+        }
+
+    Axes (weighted mean over the ones that are evaluable):
+      - detection  (0.45): does presence/absence of LVO match the label?
+      - vessel     (0.20): correct vessel (only when anomaly present & vessel labeled)
+      - side       (0.25): correct laterality (only when anomaly present & side labeled)
+      - calibration(0.10): penalize overconfidence; reward appropriate hedging
+    (Laterality is weighted heavily because wrong-side errors mislead treatment.)
+    A multiplicative safety factor penalizes internal contradictions.
+    """
+    gt = parse_labels(labels)
+    claims = parse_report_claims(prediction)
+
+    components: Dict[str, float] = {}
+    weights: Dict[str, float] = {}
+
+    # --- Detection (presence/absence of large-vessel occlusion) ---
+    if gt["anomaly"] is not None:
+        weights["detection"] = 0.45
+        if gt["anomaly"] is True:
+            if claims["asserts_positive"]:
+                components["detection"] = 1.0
+            elif claims["asserts_negative"] and not claims["hedged"]:
+                components["detection"] = 0.0   # confident miss (worst case)
+            elif claims["hedged"]:
+                components["detection"] = 0.5   # hedged, didn't commit
+            else:
+                components["detection"] = 0.3
+        else:  # anomaly absent (normal)
+            if claims["asserts_positive"]:
+                components["detection"] = 0.0   # false positive
+            elif claims["asserts_negative"]:
+                components["detection"] = 1.0
+            elif claims["hedged"]:
+                components["detection"] = 0.7   # cautious, acceptable
+            else:
+                components["detection"] = 0.5
+
+    # --- Vessel correctness (only meaningful for true positives) ---
+    if gt["anomaly"] is True and gt["vessel"]:
+        weights["vessel"] = 0.20
+        if not claims["vessels"]:
+            components["vessel"] = 0.3          # under-specified, not wrong
+        elif gt["vessel"] in claims["vessels"]:
+            components["vessel"] = 1.0
+        else:
+            components["vessel"] = 0.0          # named the wrong vessel
+
+    # --- Side correctness (laterality errors are clinically serious) ---
+    if gt["anomaly"] is True and gt["side"] in {"left", "right", "bilateral"}:
+        weights["side"] = 0.25
+        if claims["side"] is None:
+            components["side"] = 0.3
+        elif claims["side"] == gt["side"]:
+            components["side"] = 1.0
+        else:
+            components["side"] = 0.0
+
+    # --- Calibration (always evaluable) ---
+    weights["calibration"] = 0.10
+    cal = 1.0 - 0.25 * claims["overconfident"]
+    if gt["anomaly"] is False and claims["hedged"]:
+        cal = min(1.0, cal + 0.1)
+    components["calibration"] = max(0.0, min(1.0, cal))
+
+    available = any(k in weights for k in ("detection", "vessel", "side"))
+
+    if not weights:
+        return {"available": False, "score": 0.0, "components": {},
+                "claims": claims, "labels": gt}
+
+    total_w = sum(weights.values())
+    score = sum(components[k] * weights[k] for k in weights) / total_w
+
+    # Multiplicative safety penalty for internal contradictions.
+    contradictions = ClinicalRubricScorer()._detect_contradictions(prediction)
+    if contradictions:
+        score *= max(0.0, 1.0 - 0.3 * len(contradictions))
+
+    return {
+        "available": available,
+        "score": float(max(0.0, min(1.0, score))),
+        "components": components,
+        "weights": weights,
+        "claims": claims,
+        "labels": gt,
+        "contradictions": contradictions,
+    }
+
+
+def fact_based_score(
+    prediction: str,
+    labels: Optional[Dict[str, Any]] = None,
+    reference: Optional[str] = None,
+) -> float:
+    """
+    Thin float wrapper around `fact_based_report`.
+
+    If labels carry no usable ground truth, falls back to `rule_based_score`
+    (structure + clinical rubric + ROUGE) so the pipeline still produces a value.
+    """
+    report = fact_based_report(prediction, labels)
+    if report["available"]:
+        return report["score"]
+    return rule_based_score(prediction, reference)
 
 
 # ============================================================================

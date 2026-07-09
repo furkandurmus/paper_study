@@ -11,3 +11,9 @@ __pycache__
 outputs
 .cache
 .hf
+
+# Large data — mount at runtime, never bake into the image
+data
+mri_dwi_study/data
+mri_dwi_study/outputs
+mip_images

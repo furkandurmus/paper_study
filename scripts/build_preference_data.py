@@ -28,7 +28,8 @@ from tqdm import tqdm
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.scoring import rule_based_score, llm_judge_score
+from src.scoring import rule_based_score, fact_based_score
+from src.reward import CompositeReward, CompositeWeights, LLMJudge
 
 
 def parse_args():
@@ -62,9 +63,43 @@ def parse_args():
     parser.add_argument(
         "--scoring_method",
         type=str,
-        default="rule_based",
-        choices=["rule_based", "llm_judge", "random"],
-        help="Method to score candidates"
+        default="composite",
+        choices=["composite", "fact_based", "rule_based", "random"],
+        help=(
+            "Method to score candidates. 'composite' (recommended) combines the "
+            "label-grounded fact score, an image-grounded LLM judge (if configured), "
+            "structure, and reference similarity. 'fact_based' uses only the "
+            "structured labels. 'rule_based' is the legacy lexical/structural score."
+        ),
+    )
+    parser.add_argument(
+        "--images_root",
+        type=str,
+        default=None,
+        help="Root directory for images (required for the LLM judge in 'composite').",
+    )
+    parser.add_argument(
+        "--use_llm_judge",
+        action="store_true",
+        help="Enable the image-grounded LLM judge inside 'composite' scoring.",
+    )
+    parser.add_argument(
+        "--judge_model",
+        type=str,
+        default=None,
+        help="Judge model id (or set LLM_JUDGE_MODEL). Implies --use_llm_judge.",
+    )
+    parser.add_argument(
+        "--weight_fact", type=float, default=0.5, help="Composite weight: fact-based score"
+    )
+    parser.add_argument(
+        "--weight_judge", type=float, default=0.3, help="Composite weight: LLM judge"
+    )
+    parser.add_argument(
+        "--weight_structure", type=float, default=0.1, help="Composite weight: structure"
+    )
+    parser.add_argument(
+        "--weight_similarity", type=float, default=0.1, help="Composite weight: reference similarity"
     )
     parser.add_argument(
         "--score_threshold",
@@ -114,50 +149,71 @@ def score_candidates(
     candidates_data: List[Dict[str, Any]],
     references: Dict[str, str],
     scoring_method: str,
-    llm_judge_model: Optional[str] = None
+    composite_reward: Optional["CompositeReward"] = None,
+    images_root: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Score all candidates using the specified method."""
+    """Score all candidates using the specified method.
+
+    Note: unlike the legacy behaviour, reference candidates are scored by the
+    same scorer as everything else. With a label-grounded/judge reward the
+    reference is no longer assumed to be perfect, which avoids collapsing the
+    preference signal back onto "reproduce the reference string".
+    """
     scored_data = []
-    
+
     for item in tqdm(candidates_data, desc="Scoring candidates"):
         case_id = item["case_id"]
         reference = references.get(case_id, None)
-        
+        labels = item.get("labels", {})
+        image_paths = item.get("images", [])
+
         scored_candidates = []
         for candidate in item["candidates"]:
             text = candidate["text"]
-            
-            # Skip reference candidates for scoring (they get max score)
-            if candidate.get("is_reference", False):
-                score = 1.0
-            else:
-                if scoring_method == "rule_based":
-                    score = rule_based_score(text, reference)
-                elif scoring_method == "llm_judge":
-                    score = llm_judge_score(
-                        text,
-                        item["prompt"],
-                        judge_model=llm_judge_model
-                    )
-                else:  # random
-                    import random
-                    score = random.uniform(0.0, 1.0)
-            
-            scored_candidates.append({
+            score_detail = None
+
+            if scoring_method == "composite":
+                detail = composite_reward.score_detailed(
+                    prediction=text,
+                    reference=reference,
+                    labels=labels,
+                    prompt=item.get("prompt", ""),
+                    image_paths=image_paths,
+                    images_root=images_root,
+                    case_id=case_id,
+                )
+                score = detail["score"]
+                # Keep a compact, JSON-serializable breakdown (drop dataclass objects).
+                score_detail = {
+                    "components": detail["components"],
+                    "weights_used": detail["weights_used"],
+                }
+            elif scoring_method == "fact_based":
+                score = fact_based_score(text, labels, reference)
+            elif scoring_method == "rule_based":
+                score = rule_based_score(text, reference)
+            else:  # random
+                import random
+                score = random.uniform(0.0, 1.0)
+
+            entry = {
                 "text": text,
                 "score": score,
-                "metadata": {k: v for k, v in candidate.items() if k != "text"}
-            })
-        
+                "metadata": {k: v for k, v in candidate.items() if k != "text"},
+            }
+            if score_detail is not None:
+                entry["score_detail"] = score_detail
+            scored_candidates.append(entry)
+
         scored_data.append({
             "case_id": case_id,
-            "images": item["images"],
+            "images": image_paths,
             "prompt": item["prompt"],
-            "labels": item.get("labels", {}),
+            "labels": labels,
             "candidates": scored_candidates,
             "reference": reference
         })
-    
+
     return scored_data
 
 
@@ -295,13 +351,41 @@ def main():
         references = load_references(args.reference_jsonl)
         logger.info(f"Loaded {len(references)} references")
     
+    # Build the composite reward (if requested)
+    composite_reward = None
+    if args.scoring_method == "composite":
+        judge = None
+        want_judge = args.use_llm_judge or bool(args.judge_model)
+        if want_judge:
+            judge = LLMJudge(model=args.judge_model)
+            if not judge.is_available:
+                logger.warning(
+                    "LLM judge requested but unavailable (%s). Composite will use "
+                    "fact + structure (+ similarity) only.",
+                    judge._init_error,
+                )
+        composite_reward = CompositeReward(
+            weights=CompositeWeights(
+                fact=args.weight_fact,
+                judge=args.weight_judge,
+                structure=args.weight_structure,
+                similarity=args.weight_similarity,
+            ),
+            judge=judge,
+        )
+        if want_judge and (not args.images_root):
+            logger.warning(
+                "LLM judge needs --images_root to load images; judge will abstain."
+            )
+
     # Score candidates
     logger.info("Scoring candidates...")
     scored_data = score_candidates(
         candidates_data,
         references,
         args.scoring_method,
-        args.llm_judge_model
+        composite_reward=composite_reward,
+        images_root=args.images_root,
     )
     
     # Build and save datasets

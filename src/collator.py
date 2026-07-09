@@ -32,79 +32,72 @@ class SFTDataCollator:
         - images: List[PIL.Image]
         - conversation: List[Dict] with chat format
         """
-        # Collect all images and build texts
+        # Collect images, full texts, and prompt-only texts (per example).
         all_images = []
         all_texts = []
-        
+        prompt_texts = []
+
         for example in batch:
-            images = example["images"]
             conversation = example["conversation"]
-            
-            # Apply chat template
-            text = self.processor.apply_chat_template(
-                conversation,
-                tokenize=False,
-                add_generation_prompt=False
+            all_texts.append(
+                self.processor.apply_chat_template(
+                    conversation, tokenize=False, add_generation_prompt=False
+                )
             )
-            
-            all_images.append(images)
-            all_texts.append(text)
-        
-        # Process with processor
-        # Flatten images for batch processing
+            # Prompt-only = drop the final (assistant) turn, add the generation prompt.
+            prompt_texts.append(
+                self.processor.apply_chat_template(
+                    conversation[:-1], tokenize=False, add_generation_prompt=True
+                )
+            )
+            all_images.append(example["images"])
+
+        # Flatten images for batch processing.
         flattened_images = [img for imgs in all_images for img in imgs]
-        
-        # Tokenize with images
+
         batch_inputs = self.processor(
             text=all_texts,
             images=flattened_images if flattened_images else None,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.max_length
+            max_length=self.max_length,
         )
-        
-        # Create labels (mask prompt tokens with ignore_index)
-        labels = batch_inputs["input_ids"].clone()
-        
-        # Find the assistant response start and mask everything before it
-        # This is model-specific; for Qwen, we look for assistant tokens
-        for i, text in enumerate(all_texts):
-            # Find where assistant response starts
-            # This is a simplified approach - may need adjustment per model
-            assistant_start = self._find_assistant_start(text)
-            if assistant_start > 0:
-                # Tokenize just the prompt part to find length
-                prompt_text = text[:assistant_start]
-                prompt_tokens = self.processor.tokenizer(
-                    prompt_text,
-                    return_tensors="pt",
-                    add_special_tokens=False
-                )
-                prompt_len = prompt_tokens["input_ids"].shape[1]
-                # Mask prompt tokens
-                labels[i, :min(prompt_len, labels.shape[1])] = self.ignore_index
-        
+
+        input_ids = batch_inputs["input_ids"]
+        attention_mask = batch_inputs.get("attention_mask")
+        labels = input_ids.clone()
+
+        # (1) Never compute loss on padding tokens.
+        if attention_mask is not None:
+            labels[attention_mask == 0] = self.ignore_index
+
+        # (2) Completion-only masking: hide the prompt (INCLUDING the expanded image
+        #     tokens) so loss is computed only on the assistant response. The prompt
+        #     length is measured by running the *processor* (with images) on the
+        #     prompt-only turns, which reproduces image-placeholder expansion -- a
+        #     text-only token count would be far too short for a VLM and would leak
+        #     image tokens into the supervised span.
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        padding_side = getattr(tokenizer, "padding_side", "right")
+        for i, (prompt_text, imgs) in enumerate(zip(prompt_texts, all_images)):
+            prompt_inputs = self.processor(
+                text=[prompt_text],
+                images=imgs if imgs else None,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
+            prompt_len = int(prompt_inputs["input_ids"].shape[1])
+            if attention_mask is not None and padding_side == "left":
+                start = int((attention_mask[i] == 0).sum().item())
+            else:
+                start = 0
+            end = min(start + prompt_len, labels.shape[1])
+            labels[i, start:end] = self.ignore_index
+
         batch_inputs["labels"] = labels
-        
         return batch_inputs
-    
-    def _find_assistant_start(self, text: str) -> int:
-        """Find the position where assistant response starts."""
-        # Common patterns for different models
-        patterns = [
-            "assistant\n",  # Qwen format
-            "Assistant:",
-            "<|im_start|>assistant",
-            "[/INST]",  # Llama format
-        ]
-        
-        for pattern in patterns:
-            pos = text.find(pattern)
-            if pos != -1:
-                return pos + len(pattern)
-        
-        return 0
 
 
 class PreferenceDataCollator:

@@ -53,6 +53,35 @@ logs/
 wandb/
 *.log
 
+# ── Kept LOCAL only — NOT part of this CTA-MIP code repo ──
+# Separate studies (each gets its own repo): ISLES'26/ATLAS and the ISLES'22 DWI arm.
+mri_dwi_study/
+isles26_study/
+# Teaching / scratch scripts written while learning.
+learn/
+# Preprocessing image outputs + PATIENT DATA (PHI) — must NEVER be committed.
+mip_images/
+preprocessed_brains/
+# Thesis / progress documents (keep local).
+*.pptx
+*.pdf
+*.docx
+*.html
+# Windows download markers, tooling index, and the stray brace-expansion dir.
+*Zone.Identifier
+.codegraph/
+{data,src,scripts,configs,outputs}/
+# Raw DICOM + patient scans (PHI in the files AND the DICOM headers) — NEVER commit.
+*.dcm
+raw_stroke_images/
+mip_images*/
+# Brain volumes (NRRD/NIfTI) anywhere — patient scans, never commit.
+*.nrrd
+*.nii
+*.nii.gz
+preprocessed*/
+preperocessed*/
+
 # Model weights (large files)
 *.bin
 *.safetensors
